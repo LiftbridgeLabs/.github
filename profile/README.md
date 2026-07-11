@@ -48,6 +48,8 @@ A straightforward budgeting project for tracking everyday finances.
 
 Each public project maintains its own documentation and issue tracker. For Morrow help, bug reports, and feature requests, visit [Morrow-Docs](https://github.com/LiftbridgeLabs/Morrow-Docs).
 
+Voluntary support for continued Liftbridge Labs development is available through [Buy Me a Coffee](https://buymeacoffee.com/liftbridgelabs).
+
 ## About
 
 Liftbridge Labs favors dependable, understandable software built around clear purposes and maintainable foundations.
