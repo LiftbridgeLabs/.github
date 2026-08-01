@@ -10,7 +10,7 @@ Liftbridge Labs builds focused applications and open-source tools intended to so
 
 <img src="https://raw.githubusercontent.com/LiftbridgeLabs/Morrow-Docs/main/assets/morrow-icon.png" alt="Morrow app icon" width="96" align="left">
 
-**A native audiobook player for iPhone and iPad — your audiobooks, your servers, one beautiful player.**
+**A native audiobook player for iPhone and iPad. Your audiobooks, your servers, one beautiful player.**
 
 Morrow connects to self-hosted **BookOrbit** and **Audiobookshelf** libraries: multiple servers at once, a unified in-progress shelf, cross-server position sync, offline downloads with an automatic playback cache, and iCloud configuration backup. Commercial, closed-source, currently in active development ahead of App Store release.
 
@@ -27,32 +27,6 @@ Morrow connects to self-hosted **BookOrbit** and **Audiobookshelf** libraries: m
 A utility for identifying and handling empty media folders in automated media-management workflows.
 
 - [View the repository](https://github.com/LiftbridgeLabs/emptyarr)
-
-### Easynews as Indexer
-
-A project for integrating Easynews into compatible media automation workflows.
-
-- [View the repository](https://github.com/LiftbridgeLabs/easynews_as_indexer)
-
-## Other projects
-
-### RazorGen
-
-A Liftbridge Labs development project focused on practical generation and automation workflows.
-
-- [View the repository](https://github.com/LiftbridgeLabs/razorgen)
-
-### Meridian Hub
-
-A central project hub for the Meridian ecosystem.
-
-- [View the repository](https://github.com/LiftbridgeLabs/meridian-hub)
-
-### Basic Budget Manager
-
-A straightforward budgeting project for tracking everyday finances.
-
-- [View the repository](https://github.com/LiftbridgeLabs/basic-budget-manager)
 
 ## Support
 
