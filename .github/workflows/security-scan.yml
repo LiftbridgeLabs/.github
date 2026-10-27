@@ -1,0 +1,123 @@
+# Shared security scans for every Liftbridge Labs repo (Jason's Rule #2).
+# Each repo calls this from its own small workflow (see README "Security scans").
+#
+#   secrets    gitleaks over the whole git history, pinned binary + checksum
+#   npm-audit  known vulnerabilities in shipped (non-dev) npm dependencies
+#   pip-audit  known vulnerabilities in Python requirements files
+#   alert      posts to Discord (#alerts) when any of the above fails
+#
+# A failing scan is a finding: fix the code or dependency it names. Never
+# loosen a scan to make it pass.
+name: Security scan
+
+on:
+  workflow_call:
+    inputs:
+      npm-dirs:
+        description: "Space-separated directories that hold a package-lock.json"
+        type: string
+        default: ""
+      pip-requirements:
+        description: "Space-separated requirements files to audit"
+        type: string
+        default: ""
+    secrets:
+      DISCORD_WEBHOOK:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  PIP_AUDIT_VERSION: "2.10.1"
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          curl -sSfL -o gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check
+          tar xzf gitleaks.tgz gitleaks
+
+      - name: Scan the full history for secrets
+        # --redact keeps any match out of the public log.
+        run: ./gitleaks detect --source . --redact --no-banner --exit-code 1
+
+  npm-audit:
+    if: inputs.npm-dirs != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Audit shipped dependencies (high and critical fail the run)
+        env:
+          NPM_DIRS: ${{ inputs.npm-dirs }}
+        run: |
+          status=0
+          for dir in $NPM_DIRS; do
+            echo "::group::npm audit $dir"
+            (cd "$dir" && npm audit --omit=dev --audit-level=high --package-lock-only) || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  pip-audit:
+    if: inputs.pip-requirements != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Audit Python requirements
+        env:
+          PIP_REQS: ${{ inputs.pip-requirements }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pa"
+          "$RUNNER_TEMP/pa/bin/pip" install --quiet "pip-audit==${PIP_AUDIT_VERSION}"
+          status=0
+          for req in $PIP_REQS; do
+            echo "::group::pip-audit $req"
+            "$RUNNER_TEMP/pa/bin/pip-audit" --requirement "$req" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  alert:
+    needs: [secrets, npm-audit, pip-audit]
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "No DISCORD_WEBHOOK secret set, skipping the alert."
+            exit 0
+          fi
+          # The webhook URL is a credential: never echo it.
+          payload=$(jq -n --arg c "Security scan failed in ${REPO}: ${RUN_URL}" \
+            '{content: $c, allowed_mentions: {parse: []}, flags: 4}')
+          # --fail makes a 4xx/5xx from Discord (a revoked webhook) fail this
+          # job, so a broken alert path shows up instead of going silent.
+          curl --fail -sS -o /dev/null -X POST -H 'Content-Type: application/json' \
+            -A 'liftbridge-security-scan' --data "$payload" "$DISCORD_WEBHOOK"
