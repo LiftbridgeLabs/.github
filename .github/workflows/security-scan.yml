@@ -117,14 +117,19 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           REPO: ${{ github.repository }}
           FAILED: ${{ contains(needs.*.result, 'failure') }}
+          TEST: ${{ inputs.test-alert }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "No DISCORD_WEBHOOK secret set, skipping the alert."
+            # A test that can't send anything has failed.
+            [ "$TEST" = "true" ] && exit 1
             exit 0
           fi
           # The webhook URL is a credential: never echo it.
-          if [ "$FAILED" = "true" ]; then
+          if [ "$FAILED" = "true" ] && [ "$TEST" = "true" ]; then
+            msg="Test alert from ${REPO}, and a scan really failed: ${RUN_URL}"
+          elif [ "$FAILED" = "true" ]; then
             msg="Security scan failed in ${REPO}: ${RUN_URL}"
           else
             msg="Test alert from ${REPO}, nothing failed: ${RUN_URL}"
