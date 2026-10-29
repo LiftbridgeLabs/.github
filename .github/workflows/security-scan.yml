@@ -2,9 +2,11 @@
 # Each repo calls this from its own small workflow (see README "Security scans").
 #
 #   secrets    gitleaks over the whole git history, pinned binary + checksum
-#   npm-audit  known vulnerabilities in shipped (non-dev) npm dependencies
+#   npm-audit  known vulnerabilities in all npm dependencies, build tools
+#              included (vite-built sites bundle some devDependencies)
 #   pip-audit  known vulnerabilities in Python requirements files
-#   alert      posts to Discord (#alerts) when any of the above fails
+#   alert      posts to Discord (#alerts) when any of the above fails, or a
+#              labeled test message when the caller passes test-alert
 #
 # A failing scan is a finding: fix the code or dependency it names. Never
 # loosen a scan to make it pass.
@@ -21,6 +23,10 @@ on:
         description: "Space-separated requirements files to audit"
         type: string
         default: ""
+      test-alert:
+        description: "Post a test message to Discord, to check the alert path"
+        type: boolean
+        default: false
     secrets:
       DISCORD_WEBHOOK:
         required: false
@@ -63,14 +69,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Audit shipped dependencies (high and critical fail the run)
+      # devDependencies are audited too: vite and vinext bundle some of them
+      # (react-server-dom-webpack, for one) into what ships to visitors.
+      - name: Audit all dependencies (high and critical fail the run)
         env:
           NPM_DIRS: ${{ inputs.npm-dirs }}
         run: |
           status=0
           for dir in $NPM_DIRS; do
             echo "::group::npm audit $dir"
-            (cd "$dir" && npm audit --omit=dev --audit-level=high --package-lock-only) || status=1
+            (cd "$dir" && npm audit --audit-level=high --package-lock-only) || status=1
             echo "::endgroup::"
           done
           exit $status
@@ -100,7 +108,7 @@ jobs:
 
   alert:
     needs: [secrets, npm-audit, pip-audit]
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    if: ${{ always() && (contains(needs.*.result, 'failure') || inputs.test-alert) }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -108,6 +116,7 @@ jobs:
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           REPO: ${{ github.repository }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -z "$DISCORD_WEBHOOK" ]; then
@@ -115,7 +124,12 @@ jobs:
             exit 0
           fi
           # The webhook URL is a credential: never echo it.
-          payload=$(jq -n --arg c "Security scan failed in ${REPO}: ${RUN_URL}" \
+          if [ "$FAILED" = "true" ]; then
+            msg="Security scan failed in ${REPO}: ${RUN_URL}"
+          else
+            msg="Test alert from ${REPO}, nothing failed: ${RUN_URL}"
+          fi
+          payload=$(jq -n --arg c "$msg" \
             '{content: $c, allowed_mentions: {parse: []}, flags: 4}')
           # --fail makes a 4xx/5xx from Discord (a revoked webhook) fail this
           # job, so a broken alert path shows up instead of going silent.
