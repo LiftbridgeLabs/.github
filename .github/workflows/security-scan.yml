@@ -477,7 +477,7 @@ jobs:
                       continue
                   if ref.startswith("docker://"):
                       out[ref.split("@")[0]] = ("unchecked", "a Docker image")
-                  elif "${{" in ref:
+                  elif "$" + "{{" in ref:  # an expression; written split so GitHub doesn't parse it
                       out[ref] = ("unchecked", "an expression, not a fixed action")
                   else:
                       owner_repo = "/".join(ref.split("@")[0].split("/")[:2]).lower()
