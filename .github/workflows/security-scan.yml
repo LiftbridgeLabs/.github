@@ -5,6 +5,9 @@
 #   npm-audit  known vulnerabilities in all npm dependencies, build tools
 #              included (vite-built sites bundle some devDependencies)
 #   pip-audit  known vulnerabilities in Python requirements files
+#   new-deps   dependency names a push or pull request adds, looked up on
+#              their registry: fails when a name isn't there or was first
+#              published under 30 days ago (invented or squatted packages)
 #   alert      posts to Discord (#alerts) when any of the above fails, or a
 #              labeled test message when the caller passes test-alert
 #
@@ -106,8 +109,789 @@ jobs:
           done
           exit $status
 
+  # new-deps: the audits above only know about published vulnerabilities.
+  # An AI can suggest a package name that doesn't exist, and attackers
+  # register such names ("slopsquatting"); this job catches a brand-new or
+  # missing name when a push or pull request adds it. Chats vet a package
+  # before adding it (Jason's Rule #2, item 6); this is the backstop.
+  #
+  # Reads, wherever they are in the repo: package-lock.json (npm),
+  # requirements*.txt, pyproject.toml, uv.lock, poetry.lock (PyPI),
+  # *gradle.lockfile and *.versions.toml (Google Maven, Maven Central, and
+  # the Gradle Plugin Portal for plugins), Package.resolved and Package.swift
+  # (Swift packages), and uses: lines in .github/workflows (GitHub Actions).
+  # Lockfiles list indirect dependencies too, and those are checked as well.
+  # Not read: node_modules, .build, DerivedData, Pods, Carthage, venv and
+  # .venv (installed copies and build output, never what we choose), and
+  # inspiration (Bobcast's third-party reference apps, never built).
+  #
+  # A name is "added" when no file of its kind anywhere in the repo listed
+  # it before, so a version bump, or a moved or copied lockfile, adds
+  # nothing. Push: before..after (a new branch or a force push starts from
+  # the parent of the push's oldest commit). Pull request: the merge base
+  # with the base branch..head. Other runs (weekly, manual) are skipped.
+  #
+  # What it can't tell, so a pass is not a guarantee:
+  # - Maven repositories record no "first published" date. The date used is
+  #   the upload time (Last-Modified) of the oldest version file found. It
+  #   can make a package look newer than it is, never older, so it can fail
+  #   a real package but not pass a new one. Only Google publishes to Google
+  #   Maven, and Maven Central verifies who owns a group, which is why the
+  #   date check is the useful part there. A library from any other
+  #   repository (JitPack, a private one) fails as not found.
+  # - Swift packages and Actions have no registry: the GitHub repository's
+  #   creation date stands in, with its owner and stars, and a renamed
+  #   repository is flagged "moved". Other hosts fail as unchecked. Our own
+  #   accounts (LiftbridgeLabs, jjbobzin) are skipped.
+  # - An old package passes even if it is the wrong one (a long-standing
+  #   typo name), or if its owner's account was taken over. Version bumps
+  #   are not checked here; the audits cover known-bad versions.
+  # - requirements files named anything other than requirements*.txt are
+  #   not read. Usage numbers are for people to judge, never pass or fail,
+  #   and say "unknown" when the counting service doesn't answer.
+  #
+  # A finding is fixed (remove or replace the package) or, once Jason has
+  # looked at it and said yes, accepted by a line in the calling repo's
+  # .github/accepted-dependencies.txt: "<kind> <name> <reason>", kind being
+  # npm, pypi, maven, swift or actions. A line without a reason is ignored.
+  new-deps:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Look up dependencies this change adds
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # Read-only token, only sent to api.github.com (Actions and Swift
+          # package lookups).
+          GH_TOKEN: ${{ github.token }}
+        # -I: nothing from the checked-out repo can be imported.
+        shell: python3 -I {0}
+        run: |
+          import gzip
+          import json
+          import os
+          import time
+          import re
+          import subprocess
+          import sys
+          import tomllib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime, timedelta, timezone
+          from email.utils import parsedate_to_datetime
+
+          MIN_AGE = timedelta(days=30)
+          NOW = datetime.now(timezone.utc)
+          # Folders that are never built: installed copies of packages, build caches,
+          # and Bobcast's inspiration/ (third-party apps kept for reference).
+          SKIP_DIRS = {"node_modules", ".build", "DerivedData", "Pods", "Carthage",
+                       ".venv", "venv", "inspiration"}
+          # Our own GitHub accounts: a package or action from these is our own code.
+          OWN_OWNERS = {"liftbridgelabs", "jjbobzin"}
+          ACCEPT_FILE = ".github/accepted-dependencies.txt"
+          ECO_LABEL = {"npm": "npm", "pypi": "PyPI", "maven": "Maven",
+                       "swift": "Swift packages", "actions": "GitHub Actions"}
+
+
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True,
+                                    check=True).stdout
+
+
+          def has_commit(sha):
+              return bool(sha) and subprocess.run(
+                  ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                  capture_output=True).returncode == 0
+
+
+          def clean(text):
+              # Names come from repo files: keep them from forming workflow commands
+              # or Markdown in the log and summary.
+              return re.sub(r"[^\w@./:+~ ,;()'=#-]", "?", str(text))[:200].replace("::", ": :")
+
+
+          def clean_url(url):
+              return re.sub(r"[^\w@./:+~#%=?&-]", "", url)
+
+
+          # ---- which files hold dependencies --------------------------------------
+
+          def ecosystem_of(path):
+              parts = path.split("/")
+              if SKIP_DIRS.intersection(parts[:-1]):
+                  return None
+              name = parts[-1]
+              if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
+                  return "actions"
+              if name in ("package-lock.json", "npm-shrinkwrap.json"):
+                  return "npm"
+              if (re.fullmatch(r"requirements[^/]*\.txt", name)
+                      or name in ("pyproject.toml", "uv.lock", "poetry.lock")):
+                  return "pypi"
+              if name.endswith("gradle.lockfile") or name.endswith(".versions.toml"):
+                  return "maven"
+              if name == "Package.resolved" or re.fullmatch(r"Package(@swift-[\d.]+)?\.swift", name):
+                  return "swift"
+              return None
+
+
+          # ---- parsers: each returns {name: (kind, detail)} ------------------------
+          # kind is "registry" (look it up), "own" (the repo's own code, skipped) or
+          # "unchecked" (comes from somewhere this check can't look up: fails).
+
+          def parse_npm(text):
+              data = json.loads(text)
+              out = {}
+              packages = data.get("packages")
+              if packages is not None:
+                  root = packages.get("", {})
+                  direct = set()
+                  for key in ("dependencies", "devDependencies", "optionalDependencies",
+                              "peerDependencies"):
+                      direct.update((root.get(key) or {}).keys())
+                  for key, entry in packages.items():
+                      # "" and workspace folders are this repo's own packages.
+                      if "node_modules/" not in key or entry.get("link"):
+                          continue
+                      # Bundled packages ship inside another package's tarball.
+                      if entry.get("inBundle"):
+                          continue
+                      path_name = key.rsplit("node_modules/", 1)[1]
+                      name = entry.get("name") or path_name
+                      resolved = entry.get("resolved", "")
+                      detail = "direct" if key == "node_modules/" + path_name and path_name in direct else ""
+                      if not resolved or resolved.startswith(("https://registry.npmjs.org/",
+                                                               "https://registry.yarnpkg.com/")):
+                          out[name] = ("registry", detail)
+                      elif resolved.startswith("file:"):
+                          out[name] = ("own", resolved)
+                      else:
+                          out[name] = ("unchecked", f"installed from {resolved}")
+                  return out
+
+              def walk(deps):
+                  for name, entry in (deps or {}).items():
+                      version = entry.get("version", "")
+                      if version.startswith("npm:"):
+                          name = version[4:].rsplit("@", 1)[0]
+                      if entry.get("bundled"):
+                          pass
+                      elif version.startswith("file:"):
+                          out[name] = ("own", version)
+                      elif re.match(r"\d", version) or version.startswith("npm:"):
+                          out[name] = ("registry", "")
+                      else:
+                          out[name] = ("unchecked", f"installed from {version}")
+                      walk(entry.get("dependencies"))
+              walk(data.get("dependencies"))
+              return out
+
+
+          def pep503(name):
+              return re.sub(r"[-_.]+", "-", name).lower()
+
+
+          def pep508(spec, out):
+              spec = spec.strip()
+              m = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(.*)", spec)
+              if not m:
+                  return
+              name, rest = pep503(m.group(1)), m.group(3).strip()
+              if rest.startswith("@"):
+                  url = rest[1:].split(";")[0].strip()
+                  if url.startswith("file:"):
+                      out[name] = ("own", url)
+                  else:
+                      out[name] = ("unchecked", f"installed from {url}")
+              else:
+                  out[name] = ("registry", "")
+
+
+          def parse_requirements(text):
+              out = {}
+              for raw in text.splitlines():
+                  line = re.split(r"(^|\s)#", raw, maxsplit=1)[0].strip().rstrip("\\").strip()
+                  if not line:
+                      continue
+                  if line.startswith("-"):
+                      # Options (-r, -c, --hash, --index-url) are not packages, except
+                      # an editable install, which is a local folder or a VCS URL.
+                      m = re.match(r"(-e|--editable)\s*(\S+)", line)
+                      if m:
+                          target = m.group(2)
+                          if "://" in target or target.startswith("git+"):
+                              egg = re.search(r"#egg=([A-Za-z0-9._-]+)", raw)
+                              key = pep503(egg.group(1)) if egg else target
+                              out[key] = ("unchecked", f"installed from {target}")
+                      continue
+                  if line.startswith((".", "/")) or re.match(r"[A-Za-z]:\\", line):
+                      continue
+                  if "://" in line.split(";")[0] and " @ " not in line:
+                      out[line] = ("unchecked", "installed from a URL")
+                      continue
+                  pep508(line, out)
+              return out
+
+
+          def parse_pyproject(text):
+              data = tomllib.loads(text)
+              out = {}
+              for spec in data.get("build-system", {}).get("requires", []):
+                  pep508(spec, out)
+              project = data.get("project", {})
+              for spec in project.get("dependencies", []):
+                  pep508(spec, out)
+              for specs in project.get("optional-dependencies", {}).values():
+                  for spec in specs:
+                      pep508(spec, out)
+              for specs in data.get("dependency-groups", {}).values():
+                  for spec in specs:
+                      if isinstance(spec, str):
+                          pep508(spec, out)
+              poetry = data.get("tool", {}).get("poetry", {})
+              tables = [poetry.get("dependencies", {}), poetry.get("dev-dependencies", {})]
+              tables += [g.get("dependencies", {}) for g in poetry.get("group", {}).values()]
+              for table in tables:
+                  for name, value in table.items():
+                      if name.lower() == "python":
+                          continue
+                      if isinstance(value, dict) and "path" in value:
+                          out[pep503(name)] = ("own", value["path"])
+                      elif isinstance(value, dict) and ("git" in value or "url" in value):
+                          out[pep503(name)] = ("unchecked", f"installed from {value.get('git') or value.get('url')}")
+                      else:
+                          out[pep503(name)] = ("registry", "")
+              return out
+
+
+          def parse_uv_lock(text):
+              out = {}
+              for pkg in tomllib.loads(text).get("package", []):
+                  name, source = pep503(pkg["name"]), pkg.get("source", {})
+                  if any(k in source for k in ("editable", "virtual", "directory", "path")):
+                      out[name] = ("own", "")
+                  elif source.get("registry", "").rstrip("/") == "https://pypi.org/simple":
+                      out[name] = ("registry", "")
+                  else:
+                      out[name] = ("unchecked", f"installed from {next(iter(source.values()), 'an unknown source')}")
+              return out
+
+
+          def parse_poetry_lock(text):
+              out = {}
+              for pkg in tomllib.loads(text).get("package", []):
+                  name, source = pep503(pkg["name"]), pkg.get("source")
+                  if not source:
+                      out[name] = ("registry", "")
+                  elif source.get("type") in ("directory", "file"):
+                      out[name] = ("own", "")
+                  else:
+                      out[name] = ("unchecked", f"installed from {source.get('url', source.get('type'))}")
+              return out
+
+
+          def parse_gradle_lockfile(text):
+              out = {}
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#") or line.startswith("empty="):
+                      continue
+                  coord = line.split("=", 1)[0].split(":")
+                  if len(coord) >= 2:
+                      out[f"{coord[0]}:{coord[1]}"] = ("registry", "")
+              return out
+
+
+          def parse_version_catalog(text):
+              data = tomllib.loads(text)
+              out = {}
+              for lib in data.get("libraries", {}).values():
+                  if isinstance(lib, str):
+                      parts = lib.split(":")
+                  elif "module" in lib:
+                      parts = lib["module"].split(":")
+                  else:
+                      parts = [lib.get("group", ""), lib.get("name", "")]
+                  if len(parts) >= 2 and parts[0] and parts[1]:
+                      out[f"{parts[0]}:{parts[1]}"] = ("registry", "")
+              for plugin in data.get("plugins", {}).values():
+                  plugin_id = plugin.split(":")[0] if isinstance(plugin, str) else plugin.get("id", "")
+                  if plugin_id:
+                      # A plugin id resolves through its "marker" artifact.
+                      out[f"{plugin_id}:{plugin_id}.gradle.plugin"] = ("registry", "Gradle plugin")
+              return out
+
+
+          def swift_key(url):
+              url = url.strip().lower()
+              url = re.sub(r"^(git\+)?(https?|ssh|git)://", "", url)
+              url = re.sub(r"^[^@/]+@", "", url)  # git@github.com:owner/repo
+              url = url.replace(":", "/", 1) if re.match(r"[^/]+:[^/]", url) else url
+              url = re.sub(r"^www\.", "", url)
+              return re.sub(r"(\.git)?/*$", "", url)
+
+
+          def parse_package_resolved(text):
+              data = json.loads(text)
+              out = {}
+              pins = data.get("pins") or data.get("object", {}).get("pins", [])
+              for pin in pins:
+                  location = pin.get("location") or pin.get("repositoryURL", "")
+                  kind = pin.get("kind", "remoteSourceControl")
+                  if kind == "localSourceControl":
+                      out[location] = ("own", "")
+                  elif kind == "registry":
+                      out[pin.get("identity", location)] = ("unchecked", "from a Swift package registry")
+                  elif location:
+                      out[swift_key(location)] = ("registry", "")
+              return out
+
+
+          def parse_package_swift(text):
+              out = {}
+              for m in re.finditer(r"\.package\s*\((.*?)\)\s*[,\]]", text, re.S):
+                  args = m.group(1)
+                  url = re.search(r'url\s*:\s*"([^"]+)"', args)
+                  ident = re.search(r'id\s*:\s*"([^"]+)"', args)
+                  if url:
+                      out[swift_key(url.group(1))] = ("registry", "")
+                  elif ident:
+                      out[ident.group(1)] = ("unchecked", "from a Swift package registry")
+              return out
+
+
+          def parse_workflow(text):
+              out = {}
+              for m in re.finditer(r"""^\s*(?:-\s*)?uses\s*:\s*["']?([^\s"'#]+)""", text, re.M):
+                  ref = m.group(1)
+                  if ref.startswith("./"):
+                      continue
+                  if ref.startswith("docker://"):
+                      out[ref.split("@")[0]] = ("unchecked", "a Docker image")
+                  elif "${{" in ref:
+                      out[ref] = ("unchecked", "an expression, not a fixed action")
+                  else:
+                      owner_repo = "/".join(ref.split("@")[0].split("/")[:2]).lower()
+                      out[owner_repo] = ("registry", "")
+              return out
+
+
+          def parse(eco, path, text):
+              name = path.rsplit("/", 1)[-1]
+              if eco == "npm":
+                  return parse_npm(text)
+              if eco == "pypi":
+                  if name == "pyproject.toml":
+                      return parse_pyproject(text)
+                  if name == "uv.lock":
+                      return parse_uv_lock(text)
+                  if name == "poetry.lock":
+                      return parse_poetry_lock(text)
+                  return parse_requirements(text)
+              if eco == "maven":
+                  if name.endswith("gradle.lockfile"):
+                      return parse_gradle_lockfile(text)
+                  return parse_version_catalog(text)
+              if eco == "swift":
+                  if name == "Package.resolved":
+                      return parse_package_resolved(text)
+                  return parse_package_swift(text)
+              return parse_workflow(text)
+
+
+          # ---- registry lookups ------------------------------------------------------
+
+          def http(url, method="GET", headers=None, tries=3):
+              """Returns (status, headers, body). Retries network errors and 429/5xx."""
+              req_headers = {"User-Agent": "liftbridge-security-scan", "Accept-Encoding": "gzip"}
+              req_headers.update(headers or {})
+              last = None
+              for attempt in range(tries):
+                  try:
+                      req = urllib.request.Request(url, method=method, headers=req_headers)
+                      with urllib.request.urlopen(req, timeout=30 if tries > 1 else 10) as resp:
+                          body = resp.read()
+                          if resp.headers.get("Content-Encoding") == "gzip":
+                              body = gzip.decompress(body)
+                          return resp.status, resp.headers, body
+                  except urllib.error.HTTPError as err:
+                      if err.code == 404 or (err.code < 500 and err.code != 429):
+                          return err.code, err.headers, b""
+                      last = f"HTTP {err.code}"
+                  except (urllib.error.URLError, TimeoutError, OSError) as err:
+                      last = str(err)
+                  if attempt < tries - 1:
+                      time.sleep(3 * (attempt + 1))
+              raise RuntimeError(f"{url.split('?')[0]}: {last}")
+
+
+          def get_json(url, headers=None, tries=3):
+              status, _, body = http(url, headers={"Accept": "application/json", **(headers or {})}, tries=tries)
+              return status, (json.loads(body) if status == 200 else None)
+
+
+          def iso(text):
+              return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+          def lookup_npm(name):
+              link = f"https://www.npmjs.com/package/{name}"
+              status, doc = get_json("https://registry.npmjs.org/" + urllib.parse.quote(name, safe="@"))
+              if status == 404 or (doc and "unpublished" in doc.get("time", {})):
+                  return {"link": link, "missing": "not on the npm registry"}
+              if status != 200:
+                  raise RuntimeError(f"npm registry answered HTTP {status}")
+              people = ", ".join(m.get("name", "?") for m in doc.get("maintainers", [])) or "unknown"
+              created = doc.get("time", {}).get("created")
+              usage = "unknown"
+              try:
+                  s, dl = get_json("https://api.npmjs.org/downloads/point/last-week/" + name, tries=1)
+                  if s == 200:
+                      usage = f"{dl.get('downloads', 0):,} downloads last week"
+              except RuntimeError:
+                  pass
+              return {"link": link, "publisher": f"maintainers: {people}",
+                      "first": iso(created) if created else None, "usage": usage}
+
+
+          def lookup_pypi(name):
+              link = f"https://pypi.org/project/{name}/"
+              status, doc = get_json(f"https://pypi.org/pypi/{name}/json")
+              if status == 404:
+                  return {"link": link, "missing": "not on PyPI"}
+              if status != 200:
+                  raise RuntimeError(f"PyPI answered HTTP {status}")
+              uploads = [iso(f["upload_time_iso_8601"]) for files in doc.get("releases", {}).values()
+                         for f in files if f.get("upload_time_iso_8601")]
+              if not uploads:
+                  return {"link": link, "missing": "on PyPI but has never had a file uploaded"}
+              owner = doc.get("ownership") or {}
+              users = ", ".join(r["user"] for r in owner.get("roles", []) if r.get("user"))
+              publisher = (f"organization {owner['organization']}, " if owner.get("organization") else "") + \
+                  (f"owners: {users}" if users else f"author: {doc['info'].get('author') or 'unknown'}")
+              usage = "unknown"
+              try:
+                  s, stats = get_json(f"https://pypistats.org/api/packages/{name}/recent", tries=1)
+                  if s == 200:
+                      usage = f"{stats['data']['last_month']:,} downloads last month"
+              except (RuntimeError, KeyError, TypeError):
+                  pass
+              return {"link": link, "publisher": publisher, "first": min(uploads), "usage": usage}
+
+
+          MAVEN_REPOS = [
+              ("Google Maven", "https://dl.google.com/dl/android/maven2",
+               "https://maven.google.com/web/index.html#{g}:{a}"),
+              ("Maven Central", "https://repo1.maven.org/maven2",
+               "https://central.sonatype.com/artifact/{g}/{a}"),
+              ("Gradle Plugin Portal", "https://plugins.gradle.org/m2",
+               "https://plugins.gradle.org/plugin/{pid}"),
+          ]
+
+
+          def version_key(v):
+              return [int(p) if p.isdigit() else -1 for p in re.split(r"[.\-]", v)]
+
+
+          def lookup_maven(name):
+              group, artifact = name.split(":", 1)
+              is_plugin = artifact.endswith(".gradle.plugin")
+              gpath = group.replace(".", "/")
+              found = []
+              for label, base, page in MAVEN_REPOS:
+                  # The Plugin Portal forwards other artifacts to Maven Central, so it
+                  # is only asked about plugins.
+                  if label == "Gradle Plugin Portal" and not is_plugin:
+                      continue
+                  status, _, body = http(f"{base}/{gpath}/{artifact}/maven-metadata.xml")
+                  if status != 200:
+                      continue
+                  versions = [v.text for v in ET.fromstring(body).iter("version") if v.text]
+                  if not versions:
+                      continue
+                  # No Maven repository records a "first published" date. A file's
+                  # Last-Modified time is set when it is uploaded, so the oldest one
+                  # found is a date the package already existed by: it can make a
+                  # package look newer than it is, never older.
+                  dates = []
+                  for v in dict.fromkeys([versions[0], min(versions, key=version_key)]):
+                      s, headers, _ = http(f"{base}/{gpath}/{artifact}/{v}/{artifact}-{v}.pom", method="HEAD")
+                      if s == 200 and headers.get("Last-Modified"):
+                          dates.append(parsedate_to_datetime(headers["Last-Modified"]))
+                  found.append((label, page.format(g=group, a=artifact, pid=group),
+                                min(dates) if dates else None, versions[-1]))
+              if not found:
+                  return {"link": f"https://central.sonatype.com/search?q={urllib.parse.quote(name)}",
+                          "missing": "not on Google Maven, Maven Central or the Gradle Plugin Portal"
+                                     " (if it comes from another repository, such as JitPack, check it by hand)"}
+              usage = "unknown"
+              try:
+                  s, deps = get_json("https://api.deps.dev/v3alpha/systems/maven/packages/"
+                                     f"{urllib.parse.quote(name, safe='')}/versions/"
+                                     f"{urllib.parse.quote(found[0][3], safe='')}:dependents", tries=1)
+                  if s == 200 and deps.get("dependentCount"):
+                      usage = f"{deps['dependentCount']:,} packages depend on it (deps.dev)"
+              except RuntimeError:
+                  pass
+              # Every repository that serves the name has to show it is old enough:
+              # Gradle takes whichever repository answers first.
+              dates = [d for _, _, d, _ in found]
+              return {"link": found[0][1],
+                      "publisher": f"group {group}, on " + " and ".join(f[0] for f in found),
+                      "first": None if None in dates else min(dates),
+                      "first_note": "oldest file found",
+                      "usage": usage}
+
+
+          def lookup_github(owner_repo, token):
+              link = f"https://github.com/{owner_repo}"
+              headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"} if token else {}
+              status, repo = get_json(f"https://api.github.com/repos/{owner_repo}", headers)
+              if status == 404:
+                  return {"link": link, "missing": "no such GitHub repository (or it is private)"}
+              if status != 200:
+                  raise RuntimeError(f"GitHub answered HTTP {status}")
+              notes = []
+              if repo["full_name"].lower() != owner_repo.lower():
+                  notes.append(f"moved, now {repo['full_name']}")
+              if repo.get("fork"):
+                  notes.append("a fork")
+              if repo.get("archived"):
+                  notes.append("archived")
+              return {"link": link, "publisher": f"owner: {repo['owner']['login']}",
+                      "first": iso(repo["created_at"]), "first_note": "repository created",
+                      "usage": f"{repo.get('stargazers_count', 0):,} stars" + "".join(f", {n}" for n in notes)}
+
+
+          def lookup(eco, name, token):
+              if eco == "npm":
+                  return lookup_npm(name)
+              if eco == "pypi":
+                  return lookup_pypi(name)
+              if eco == "maven":
+                  return lookup_maven(name)
+              if eco == "swift":
+                  host, _, owner_repo = name.partition("/")
+                  if host != "github.com":
+                      return {"link": "https://" + name,
+                              "missing": f"hosted on {host}, which this check can't look up; check it by hand"}
+                  return lookup_github(owner_repo, token)
+              return lookup_github(name, token)
+
+
+          # ---- what to compare ---------------------------------------------------------
+
+          def pick_range():
+              event_name = os.environ.get("EVENT_NAME", "")
+              with open(os.environ["GITHUB_EVENT_PATH"]) as f:
+                  event = json.load(f)
+              empty_tree = git("hash-object", "-t", "tree", "/dev/null").strip()
+              if event_name.startswith("pull_request"):
+                  base, head = event["pull_request"]["base"]["sha"], event["pull_request"]["head"]["sha"]
+                  if not (has_commit(base) and has_commit(head)):
+                      sys.exit(f"::error::Could not find the pull request's commits ({base[:7]}, {head[:7]}).")
+                  return git("merge-base", base, head).strip(), head, "the pull request's changes"
+              if event_name != "push":
+                  return None, None, f"a {event_name} run, which adds nothing (only pushes and pull requests are checked)"
+              head = event.get("after") or os.environ["GITHUB_SHA"]
+              if event.get("deleted"):
+                  return None, None, "a branch deletion"
+              before = event.get("before", "")
+              if before.strip("0") and has_commit(before):
+                  return before, head, f"{before[:7]}..{head[:7]}"
+              # A new branch, or a force push that replaced the earlier commit: start
+              # from the parent of the oldest commit the push brought in.
+              commits = event.get("commits") or []
+              if commits and has_commit(commits[0]["id"]):
+                  parents = git("rev-list", "--parents", "-n", "1", commits[0]["id"]).split()[1:]
+                  base = parents[0] if parents else empty_tree
+                  return base, head, f"the {len(commits)} commit(s) in this push"
+              default = (event.get("repository") or {}).get("default_branch")
+              if default and event.get("ref") != f"refs/heads/{default}" and has_commit(f"origin/{default}"):
+                  base = git("merge-base", f"origin/{default}", head).strip()
+                  return base, head, f"this branch against {default}"
+              if not before.strip("0"):
+                  return None, None, "a push that brought in no new commits"
+              print(f"::warning::The earlier commit {before[:7]} is gone (force push), "
+                    "so only the last commit is compared.")
+              parents = git("rev-list", "--parents", "-n", "1", head).split()[1:]
+              return (parents[0] if parents else empty_tree), head, "the last commit only"
+
+
+          def read_accepted(head):
+              try:
+                  text = git("show", f"{head}:{ACCEPT_FILE}")
+              except subprocess.CalledProcessError:
+                  return {}
+              accepted = {}
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split(None, 2)
+                  if len(parts) < 3:
+                      print(f"::warning::{ACCEPT_FILE}: '{clean(line)}' has no reason, so it is ignored.")
+                      continue
+                  eco, name, reason = parts
+                  eco = eco.lower()
+                  name = pep503(name) if eco == "pypi" else (name.lower() if eco in ("swift", "actions") else name)
+                  accepted[(eco, name)] = reason
+              return accepted
+
+
+          def summary(lines):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a") as f:
+                      f.write("\n".join(lines) + "\n")
+
+
+          def main():
+              base, head, what = pick_range()
+              if base is None:
+                  print(f"Nothing to compare: {what}.")
+                  summary([f"### New dependencies\nNothing to compare: {what}."])
+                  return 0
+              changed = [p for p in git("diff", "--name-only", "--no-renames", "--diff-filter=ACMRT", "-z",
+                                        base, head).split("\0") if p]
+              by_eco = {}
+              for path in changed:
+                  eco = ecosystem_of(path)
+                  if eco:
+                      by_eco.setdefault(eco, []).append(path)
+              print("Not read: " + ", ".join(sorted(SKIP_DIRS)) + " folders (never built).")
+              print(f"Compared {what}: {len(changed)} changed file(s), "
+                    f"{sum(map(len, by_eco.values()))} of them list dependencies.")
+              if not by_eco:
+                  summary([f"### New dependencies\nNo dependency files changed ({what})."])
+                  return 0
+
+              status = 0
+              base_files = [p for p in git("ls-tree", "-r", "--name-only", "-z", base).split("\0") if p]
+              new = []  # (eco, name, kind, detail, path)
+              for eco, paths in sorted(by_eco.items()):
+                  # A name counts as new only if no file of the same kind anywhere in
+                  # the repo listed it before, so moving or copying a lockfile, or
+                  # bumping a version, adds nothing.
+                  before = set()
+                  for path in base_files:
+                      if ecosystem_of(path) == eco:
+                          try:
+                              before.update(parse(eco, path, git("show", f"{base}:{path}")))
+                          except Exception as err:  # an old broken file shouldn't hide new names
+                              print(f"::warning::Could not read the earlier {clean(path)}: {clean(err)}")
+                  seen = set()
+                  for path in paths:
+                      try:
+                          names = parse(eco, path, git("show", f"{head}:{path}"))
+                      except Exception as err:
+                          print(f"::error file={clean(path)}::Could not read {clean(path)}: {clean(err)}")
+                          status = 1
+                          continue
+                      for name, (kind, detail) in names.items():
+                          if name not in before and (eco, name) not in seen:
+                              seen.add((eco, name))
+                              new.append((eco, name, kind, detail, path))
+
+              if not new:
+                  print("No new dependency names (version changes only).")
+                  summary([f"### New dependencies\nNo new dependency names ({what}); version changes are not checked here."])
+                  return status
+
+              accepted = read_accepted(head)
+              token = os.environ.get("GH_TOKEN", "")
+
+              def own(eco, name):
+                  parts = name.split("/")
+                  owner = parts[1] if eco == "swift" and len(parts) > 2 else parts[0]
+                  return eco in ("swift", "actions") and owner in OWN_OWNERS
+
+              to_lookup = [(eco, name) for eco, name, kind, _, _ in new
+                           if kind == "registry" and not own(eco, name)]
+
+              def run(key):
+                  try:
+                      return key, lookup(key[0], key[1], token)
+                  except Exception as err:
+                      return key, {"error": f"lookup failed ({err}); re-run the job"}
+
+              with ThreadPoolExecutor(max_workers=16) as pool:
+                  results = dict(pool.map(run, to_lookup))
+
+              rows = ["### New dependencies",
+                      f"Compared {what}. A name fails if its registry doesn't have it, or it was first "
+                      f"published less than {MIN_AGE.days} days ago.",
+                      "", "| Result | Kind | Name | Publisher | First published | Usage |",
+                      "|---|---|---|---|---|---|"]
+              print()
+              for eco, name, kind, detail, path in sorted(new, key=lambda n: (n[0], n[1])):
+                  info, problem, verdict = {}, None, "ok"
+                  if kind == "own":
+                      verdict, info = "skipped", {"publisher": "this repo's own code"}
+                  elif kind == "unchecked":
+                      problem = f"{detail}, which this check can't look up; check it by hand"
+                  elif (eco, name) not in results:
+                      verdict, info = "skipped", {"publisher": "our own GitHub account"}
+                  else:
+                      info = results[(eco, name)]
+                      if "error" in info:
+                          problem = info["error"]
+                      elif "missing" in info:
+                          problem = info["missing"]
+                      elif info.get("first") is None:
+                          problem = "no publish date found; check it by hand"
+                      elif NOW - info["first"] < MIN_AGE:
+                          problem = (f"first published {(NOW - info['first']).days} day(s) ago, "
+                                     f"under {MIN_AGE.days}")
+                  if problem:
+                      reason = accepted.get((eco, name))
+                      if reason:
+                          verdict, problem = "accepted", f"{problem}; accepted in {ACCEPT_FILE}: {reason}"
+                      else:
+                          verdict, status = "FAIL", 1
+                  first = info.get("first")
+                  first_text = "-"
+                  if first:
+                      first_text = first.strftime("%b %-d, %Y")
+                      if info.get("first_note"):
+                          first_text += f" ({info['first_note']})"
+                  shown, problem = clean(name), clean(problem) if problem else None
+                  publisher, usage = clean(info.get("publisher", "-")), clean(info.get("usage", "-"))
+                  link = clean_url(info.get("link", ""))
+                  print(f"  [{verdict}] {ECO_LABEL[eco]}: {shown}"
+                        + (f" ({clean(detail)})" if detail and kind == "registry" else ""))
+                  print(f"      found in {clean(path)}")
+                  if link:
+                      print(f"      {link}")
+                  if info.get("publisher"):
+                      print(f"      {publisher} | first published {first_text} | {usage}")
+                  if problem:
+                      print(f"      {problem}")
+                  if verdict == "FAIL":
+                      print(f"::error title=New dependency::{ECO_LABEL[eco]} {shown}: {problem}")
+                  rows.append(f"| {verdict} | {ECO_LABEL[eco]} | {f'[{shown}]({link})' if link else shown}"
+                              f"{'<br>' + problem if problem else ''} | {publisher} | {first_text} | {usage} |")
+              summary(rows)
+              if status:
+                  print(f"\nA new dependency failed. If Jason has looked at it and said yes, add a line "
+                        f"'<kind> <name> <reason>' to {ACCEPT_FILE} (kinds: {', '.join(ECO_LABEL)}).")
+              return status
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+
   alert:
-    needs: [secrets, npm-audit, pip-audit]
+    needs: [secrets, npm-audit, pip-audit, new-deps]
     if: ${{ always() && (contains(needs.*.result, 'failure') || inputs.test-alert) }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
