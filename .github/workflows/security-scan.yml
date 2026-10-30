@@ -727,6 +727,13 @@ jobs:
               return (parents[0] if parents else empty_tree), head, "the last commit only"
 
 
+          def accept_key(eco, name):
+              # Both sides go through this, starting from the form the log prints, so
+              # a name copied from the log always matches.
+              name = clean(name).lower()
+              return eco.lower(), pep503(name) if eco.lower() == "pypi" else name
+
+
           def read_accepted(head):
               try:
                   text = git("show", f"{head}:{ACCEPT_FILE}")
@@ -741,10 +748,7 @@ jobs:
                   if len(parts) < 3:
                       print(f"::warning::{ACCEPT_FILE}: '{clean(line)}' has no reason, so it is ignored.")
                       continue
-                  eco, name, reason = parts
-                  eco = eco.lower()
-                  name = pep503(name) if eco == "pypi" else (name.lower() if eco in ("swift", "actions") else name)
-                  accepted[(eco, name)] = reason
+                  accepted[accept_key(parts[0], parts[1])] = parts[2]
               return accepted
 
 
@@ -853,7 +857,7 @@ jobs:
                           problem = (f"first published {(NOW - info['first']).days} day(s) ago, "
                                      f"under {MIN_AGE.days}")
                   if problem:
-                      reason = accepted.get((eco, name))
+                      reason = accepted.get(accept_key(eco, name))
                       if reason:
                           verdict, problem = "accepted", f"{problem}; accepted in {ACCEPT_FILE}: {reason}"
                       else:
