@@ -8,6 +8,10 @@
 #   new-deps   dependency names a push or pull request adds, looked up on
 #              their registry: fails when a name isn't there or was first
 #              published under 30 days ago (invented or squatted packages)
+#   osv        known vulnerabilities in the lockfiles npm-audit and pip-audit
+#              don't read: Swift packages, Gradle, Go, Rust, Ruby, PHP, Dart,
+#              yarn, pnpm and Python lockfiles (OSV-Scanner, pinned binary +
+#              checksum); skipped in a repo that runs its own OSV-Scanner
 #   alert      posts to Discord (#alerts) when any of the above fails, or a
 #              labeled test message when the caller passes test-alert
 #
@@ -38,6 +42,8 @@ permissions:
   contents: read
 
 env:
+  OSV_VERSION: "v2.6.0"
+  OSV_SHA256: "ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108"
   GITLEAKS_VERSION: "8.30.1"
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   PIP_AUDIT_VERSION: "2.10.1"
@@ -108,6 +114,102 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+
+  # osv: the lockfiles npm-audit and pip-audit don't cover. package-lock.json
+  # and requirements*.txt are left to them: npm audit's severities are the
+  # ones the sites are held to, and OSV-Scanner guesses the versions of
+  # packages a requirements file doesn't pin, where pip-audit installs the
+  # real ones. High and critical fail the run, as npm-audit does, and so does
+  # a vulnerability with no severity given; the rest are listed in the run
+  # summary. A repo with its own OSV-Scanner workflow (Morrow sorts findings
+  # by whether they ship in the app; aso-hub and sofa-clicker scan in their
+  # own security.yml) keeps it, and this job steps aside there.
+  osv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find the lockfiles to scan
+        id: find
+        run: |
+          # An uncommented step running "osv-scanner scan" is a scan of its
+          # own; a comment that names it is not. This file is left out.
+          if grep -Eq --exclude=security-scan.yml '^[^#]*osv-scanner"? scan' \
+               .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null; then
+            echo "This repo runs its own OSV-Scanner; nothing to do here."
+            exit 0
+          fi
+          find . \( -name node_modules -o -name .build -o -name DerivedData -o -name Pods \
+                    -o -name Carthage -o -name venv -o -name .venv -o -name inspiration -o -name .git \) -prune \
+                 -o -type f \( -name Package.resolved -o -name '*gradle.lockfile' -o -name go.mod \
+                    -o -name Cargo.lock -o -name Gemfile.lock -o -name composer.lock -o -name pubspec.lock \
+                    -o -name yarn.lock -o -name pnpm-lock.yaml -o -name poetry.lock -o -name uv.lock \
+                    -o -name Pipfile.lock \) -print | sort > "$RUNNER_TEMP/lockfiles"
+          if [ ! -s "$RUNNER_TEMP/lockfiles" ]; then
+            echo "No lockfiles of the kinds this job reads."
+            exit 0
+          fi
+          echo "Scanning:"; cat "$RUNNER_TEMP/lockfiles"
+          echo "scan=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install OSV-Scanner (pinned, checksum verified)
+        if: steps.find.outputs.scan == 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+
+      - name: Scan (high, critical and unrated fail)
+        if: steps.find.outputs.scan == 'true'
+        run: |
+          # An array, not xargs: xargs splits paths at spaces and turns the
+          # scanner's exit 1 into its own 123.
+          args=()
+          while IFS= read -r lockfile; do args+=("-L=$lockfile"); done < "$RUNNER_TEMP/lockfiles"
+          set +e
+          "$RUNNER_TEMP/osv-scanner" scan source --no-resolve --format json "${args[@]}" > "$RUNNER_TEMP/osv.json"
+          status=$?
+          set -e
+          # 0 nothing found, 1 vulnerabilities found (judged below), 128 no
+          # packages in the files. Anything else is the scanner failing, which
+          # must fail the run without calling it a vulnerability.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ] && [ "$status" -ne 128 ]; then
+            echo "::error::osv-scanner failed (exit $status)."
+            exit "$status"
+          fi
+          python3 - "$RUNNER_TEMP/osv.json" <<'PY'
+          import json, os, sys
+          try:
+              data = json.load(open(sys.argv[1]))
+          except (OSError, ValueError):
+              data = {}
+          rows, failing = [], 0
+          for result in data.get("results", []):
+              path = result.get("source", {}).get("path", "")
+              for pkg in result.get("packages", []):
+                  name, version = pkg["package"]["name"], pkg["package"].get("version", "")
+                  for group in pkg.get("groups", []):
+                      score = group.get("max_severity") or ""
+                      try:
+                          bad = float(score) >= 7.0
+                      except ValueError:
+                          bad = True  # no severity given: treated as serious
+                      failing += bad
+                      rows.append(f"| {'FAIL' if bad else 'listed'} | {name} {version} | "
+                                  f"{score or 'unrated'} | {', '.join(group.get('ids', []))} | {os.path.relpath(path)} |")
+          lines = ["## OSV-Scanner", ""]
+          lines += (["| | Package | CVSS | Advisory | File |", "|---|---|---|---|---|"] + rows) if rows else ["No known vulnerabilities."]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          if failing:
+              print(f"::error::{failing} high, critical or unrated vulnerabilities. See the run summary.")
+              sys.exit(1)
+          PY
 
   # new-deps: the audits above only know about published vulnerabilities.
   # An AI can suggest a package name that doesn't exist, and attackers
@@ -895,7 +997,7 @@ jobs:
               sys.exit(main())
 
   alert:
-    needs: [secrets, npm-audit, pip-audit, new-deps]
+    needs: [secrets, npm-audit, pip-audit, osv, new-deps]
     if: ${{ always() && (contains(needs.*.result, 'failure') || inputs.test-alert) }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
