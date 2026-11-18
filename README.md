@@ -5,7 +5,9 @@ Organization profile and shared community files for Liftbridge Labs
 
 `.github/workflows/security-scan.yml` is the one shared definition of our
 standard scans. Every repo calls it from a small `.github/workflows/security.yml`
-of its own:
+of its own. The scans are steps of one job, named `secrets` because rulesets
+require the check `scan / secrets`: GitHub bills every job as at least a full
+minute, so a job per scan cost three to five minutes a run for seconds of work.
 
 - **secrets**: gitleaks over the whole git history (pinned binary, checksum checked)
 - **npm-audit**: known vulnerabilities in all npm dependencies, build tools included (high and critical fail)
@@ -17,7 +19,8 @@ of its own:
   usage. It fails when a name isn't on the registry or was first published
   under 30 days ago, which is how invented or freshly squatted packages look.
   Every repo gets it with no setup. What it can't check is written above the
-  job in the workflow.
+  step in the workflow.
+- **osv**: known vulnerabilities in the lockfiles the two audits don't read (OSV-Scanner, pinned binary, checksum checked)
 - **alert**: posts to Discord when a scan fails (needs the `ALERTS_DISCORD_WEBHOOK` organization secret)
 
 When new-deps fails, remove or replace the package. If Jason has looked at it

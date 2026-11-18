@@ -1,6 +1,12 @@
 # Shared security scans for every Liftbridge Labs repo (Jason's Rule #2).
 # Each repo calls this from its own small workflow (see README "Security scans").
 #
+# All the scans are steps of one job. GitHub bills every job as at least a
+# full minute, and each scan takes seconds, so one job per scan cost three
+# to five minutes a run. A failed scan doesn't stop the ones after it. The
+# job keeps the name "secrets" because rulesets require the check
+# "scan / secrets"; rename it only together with those rulesets.
+#
 #   secrets    gitleaks over the whole git history, pinned binary + checksum
 #   npm-audit  known vulnerabilities in all npm dependencies, build tools
 #              included (vite-built sites bundle some devDependencies)
@@ -51,7 +57,7 @@ env:
 jobs:
   secrets:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,27 +66,21 @@ jobs:
 
       - name: Install gitleaks (pinned, checksum verified)
         run: |
-          curl -sSfL -o gitleaks.tgz \
+          # Outside the checkout, so the later scans see the repo as it is.
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check
-          tar xzf gitleaks.tgz gitleaks
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum --check
+          tar xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
 
       - name: Scan the full history for secrets
         # --redact keeps any match out of the public log.
-        run: ./gitleaks detect --source . --redact --no-banner --exit-code 1
-
-  npm-audit:
-    if: inputs.npm-dirs != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+        run: |
+          "$RUNNER_TEMP/gitleaks" detect --source . --redact --no-banner --exit-code 1
 
       # devDependencies are audited too: vite and vinext bundle some of them
       # (react-server-dom-webpack, for one) into what ships to visitors.
-      - name: Audit all dependencies (high and critical fail the run)
+      - name: npm audit, all dependencies (high and critical fail the run)
+        if: ${{ !cancelled() && inputs.npm-dirs != '' }}
         env:
           NPM_DIRS: ${{ inputs.npm-dirs }}
         run: |
@@ -92,16 +92,8 @@ jobs:
           done
           exit $status
 
-  pip-audit:
-    if: inputs.pip-requirements != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Audit Python requirements
+      - name: pip-audit, Python requirements
+        if: ${{ !cancelled() && inputs.pip-requirements != '' }}
         env:
           PIP_REQS: ${{ inputs.pip-requirements }}
         run: |
@@ -123,16 +115,9 @@ jobs:
   # a vulnerability with no severity given; the rest are listed in the run
   # summary. A repo with its own OSV-Scanner workflow (Morrow sorts findings
   # by whether they ship in the app; aso-hub and sofa-clicker scan in their
-  # own security.yml) keeps it, and this job steps aside there.
-  osv:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Find the lockfiles to scan
+  # own security.yml) keeps it, and these steps step aside there.
+      - name: OSV-Scanner, find the lockfiles to scan
+        if: ${{ !cancelled() }}
         id: find
         run: |
           # An uncommented step running "osv-scanner scan" is a scan of its
@@ -156,15 +141,15 @@ jobs:
           echo "scan=true" >> "$GITHUB_OUTPUT"
 
       - name: Install OSV-Scanner (pinned, checksum verified)
-        if: steps.find.outputs.scan == 'true'
+        if: ${{ !cancelled() && steps.find.outputs.scan == 'true' }}
         run: |
           curl -sSfL -o "$RUNNER_TEMP/osv-scanner" \
             "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
           echo "${OSV_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum --check
           chmod +x "$RUNNER_TEMP/osv-scanner"
 
-      - name: Scan (high, critical and unrated fail)
-        if: steps.find.outputs.scan == 'true'
+      - name: OSV-Scanner, scan (high, critical and unrated fail)
+        if: ${{ !cancelled() && steps.find.outputs.scan == 'true' }}
         run: |
           # An array, not xargs: xargs splits paths at spaces and turns the
           # scanner's exit 1 into its own 123.
@@ -213,7 +198,7 @@ jobs:
 
   # new-deps: the audits above only know about published vulnerabilities.
   # An AI can suggest a package name that doesn't exist, and attackers
-  # register such names ("slopsquatting"); this job catches a brand-new or
+  # register such names ("slopsquatting"); this step catches a brand-new or
   # missing name when a push or pull request adds it. Chats vet a package
   # before adding it (Jason's Rule #2, item 6); this is the backstop.
   #
@@ -256,17 +241,8 @@ jobs:
   # looked at it and said yes, accepted by a line in the calling repo's
   # .github/accepted-dependencies.txt: "<kind> <name> <reason>", kind being
   # npm, pypi, maven, swift or actions. A line without a reason is ignored.
-  new-deps:
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Look up dependencies this change adds
+      - name: new-deps, look up dependencies this change adds
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'pull_request') }}
         env:
           EVENT_NAME: ${{ github.event_name }}
           # Read-only token, only sent to api.github.com (Actions and Swift
@@ -997,7 +973,7 @@ jobs:
               sys.exit(main())
 
   alert:
-    needs: [secrets, npm-audit, pip-audit, osv, new-deps]
+    needs: [secrets]
     if: ${{ always() && (contains(needs.*.result, 'failure') || inputs.test-alert) }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
